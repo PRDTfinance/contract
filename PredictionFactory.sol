@@ -6,6 +6,7 @@ import '@openzeppelin/contracts/access/Ownable.sol';
 import '@openzeppelin/contracts/security/ReentrancyGuard.sol';
 import '@openzeppelin/contracts/security/Pausable.sol';
 import '@openzeppelin/contracts/token/ERC20/IERC20.sol';
+import '@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol';
 
 //chainlink oracle interface
 interface AggregatorV3Interface {
@@ -20,11 +21,9 @@ interface AggregatorV3Interface {
 
 //prediction contracts are owned by the PredictionFactory contract
 contract Prediction is Ownable, Pausable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
 
     struct Round {
-        uint32 startTimestamp;
-        uint32 lockTimestamp;
-        uint32 closeTimestamp;
         bool oracleCalled;
         uint256 bullAmount;
         uint256 bearAmount;
@@ -37,7 +36,13 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
         int256 closePrice;
     }
 
-    enum Position {Bull, Bear}
+    struct Timestamps {
+        uint32 startTimestamp;
+        uint32 lockTimestamp;
+        uint32 closeTimestamp;
+    }
+
+    enum Position {Bull, Bear, Undefined}
 
     struct BetInfo {
         Position position;
@@ -51,12 +56,12 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
     IERC20 public betToken;
 
     mapping(uint256 => Round) public rounds;
+    mapping(uint256 => Timestamps) public timestamps;
     mapping(uint256 => mapping(address => BetInfo)) public ledger;
     mapping(address => uint256) public userReferenceBonuses;
     mapping(address => uint256) public totalUserReferenceBonuses;
     uint256 public currentEpoch;
     uint32 public intervalSeconds;
-    uint32 public bufferSeconds;
     uint256 public treasuryAmount;
     AggregatorV3Interface public oracle;
     uint256 public oracleLatestRoundId;
@@ -67,7 +72,6 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
     uint256 public referrerRate;
     uint256 public refereeRate;
     uint256 public minBetAmount;
-    uint256 public oracleUpdateAllowance; // seconds
 
     bool public genesisStartOnce = false;
     bool public genesisLockOnce = false;
@@ -85,7 +89,7 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
     event PredictionsUnpause(uint256 epoch);
     event PredictionsBet(address indexed sender, uint256 indexed currentEpoch, uint256 amount, uint256 refereeAmount, uint256 stakingAmount, uint8 position);
     event PredictionsClaim(address indexed sender, uint256 indexed currentEpoch, uint256 amount);
-    event PredictionsRewardsCalculated(uint256 indexed currentEpoch, int8 position, uint256 rewardBaseCalAmount, uint256 rewardAmount, uint256 treasuryAmount);
+    event PredictionsRewardsCalculated(uint256 indexed currentEpoch, uint8 position, uint256 rewardBaseCalAmount, uint256 rewardAmount, uint256 treasuryAmount);
     event PredictionsReferrerBonus(address indexed user, address indexed referrer, uint256 amount, uint256 indexed currentEpoch);
     event PredictionsSetReferralRates(uint256 currentEpoch, uint256 _referrerRate, uint256 _refereeRate);
     event PredictionsSetOracle(uint256 currentEpoch, address _oracle);
@@ -100,9 +104,7 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
     function initialize(
         AggregatorV3Interface _oracle,
         uint32 _intervalSeconds,
-        uint32 _bufferSeconds,
         uint256 _minBetAmount,
-        uint256 _oracleUpdateAllowance,
         IERC20 _betToken,
         uint256 _treasuryRate,
         uint256 _referrerRate,
@@ -118,9 +120,7 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
 
         oracle = _oracle;
         intervalSeconds = _intervalSeconds;
-        bufferSeconds = _bufferSeconds;
         minBetAmount = _minBetAmount;
-        oracleUpdateAllowance = _oracleUpdateAllowance;
 
         betToken = _betToken;
 
@@ -137,18 +137,10 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
      * @dev set interval blocks
      * callable by owner
      */
-    function setIntervalSeconds(uint32 _intervalSeconds) external onlyOwner {
+    function setIntervalSeconds(uint32 _intervalSeconds) external onlyOwner whenPaused {
         intervalSeconds = _intervalSeconds;
     }
 
-    /**
-     * @dev set buffer blocks
-     * callable by owner
-     */
-    function setBufferSeconds(uint32 _bufferSeconds) external onlyOwner {
-        require(_bufferSeconds <= intervalSeconds);
-        bufferSeconds = _bufferSeconds;
-    }
 
     /**
      * @dev set Oracle address
@@ -158,14 +150,6 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
         require(_oracle != address(0));
         oracle = AggregatorV3Interface(_oracle);
         emit PredictionsSetOracle(currentEpoch, _oracle);
-    }
-
-    /**
-     * @dev set oracle update allowance
-     * callable by owner
-     */
-    function setOracleUpdateAllowance(uint256 _oracleUpdateAllowance) external onlyOwner {
-        oracleUpdateAllowance = _oracleUpdateAllowance;
     }
 
     /**
@@ -201,12 +185,12 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
     }
 
     /**
-     * @dev Lock genesis round
+     * @dev Lock genesis round, intervalSeconds is used as the buffer period
      */
     function genesisLockRound() external onlyOwner whenNotPaused {
         require(genesisStartOnce, "req genesisStart");
         require(!genesisLockOnce);
-        require(block.timestamp <= rounds[currentEpoch].lockTimestamp + bufferSeconds,">buffer");
+        require(block.timestamp <= timestamps[currentEpoch].lockTimestamp + intervalSeconds,">buffer");
 
         int256 currentPrice = _getPriceFromOracle();
         _safeLockRound(currentEpoch, currentPrice);
@@ -219,7 +203,7 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
     /**
      * @dev Start the next round n, lock price for round n-1, end round n-2
      */
-    function executeRound() external onlyOwner whenNotPaused {
+    function executeRound() external whenNotPaused {
         require(genesisStartOnce && genesisLockOnce, "req genesis");
 
         int256 currentPrice = _getPriceFromOracle();
@@ -262,7 +246,10 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
 
         //check and set staking bonuses
         uint stakingLvl = staker.getUserStakingLevel(user);
-        if(stakingLvl > 0 && stakingBonuses.length > stakingLvl)
+        if(stakingLvl >= stakingBonuses.length)
+            stakingLvl = stakingBonuses.length - 1;
+
+        if(stakingLvl > 0)
         {
             stakingAmt = treasuryAmt * stakingBonuses[stakingLvl] / 100;
             round.bearBonusAmount = round.bearBonusAmount + stakingAmt;
@@ -280,7 +267,7 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
         betInfo.referrerAmount = referrerAmt;
         betInfo.stakingAmount = stakingAmt;
 
-        emit PredictionsBet(user, epoch, amount, refereeAmt, stakingAmt, 1);
+        emit PredictionsBet(user, epoch, amount, refereeAmt, stakingAmt, uint8(Position.Bear));
     }
 
     /**
@@ -330,7 +317,7 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
         betInfo.referrerAmount = referrerAmt;
         betInfo.stakingAmount = stakingAmt;
 
-        emit PredictionsBet(user, epoch, amount, refereeAmt, stakingAmt, 0);
+        emit PredictionsBet(user, epoch, amount, refereeAmt, stakingAmt, uint8(Position.Bull));
     }
 
     function hasReferenceBonus(address _user) external view returns (bool) {
@@ -341,7 +328,7 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
         require(userReferenceBonuses[_user] > 0, "nobonuses");
         uint reward = userReferenceBonuses[_user];
         userReferenceBonuses[_user] = 0;
-        _safeTransferbetToken(_user, reward);
+        betToken.safeTransfer(_user, reward);
     }
 
     /**
@@ -351,8 +338,8 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
         uint256 reward; // Initializes reward
 
         for (uint256 i = 0; i < epochs.length; i++) {
-            require(rounds[epochs[i]].startTimestamp != 0);
-            require(block.timestamp > rounds[epochs[i]].closeTimestamp);
+            require(timestamps[epochs[i]].startTimestamp != 0);
+            require(block.timestamp > timestamps[epochs[i]].closeTimestamp);
 
             uint256 addedReward = 0;
             BetInfo storage betInfo = ledger[epochs[i]][user];
@@ -386,7 +373,7 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
         }
 
         if (reward > 0) {
-            _safeTransferbetToken(user, reward);
+            betToken.safeTransfer(user, reward);
         }
     }
 
@@ -397,7 +384,7 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
     function claimTreasury(address _recipient) external nonReentrant onlyOwner {
         uint256 currentTreasuryAmount = treasuryAmount;
         treasuryAmount = 0;
-        _safeTransferbetToken(_recipient, currentTreasuryAmount);
+        betToken.safeTransfer(_recipient, currentTreasuryAmount);
     }
 
     /**
@@ -442,7 +429,7 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
     function refundable(uint256 epoch, address user) public view returns (bool) {
         BetInfo memory betInfo = ledger[epoch][user];
         Round memory round = rounds[epoch];
-        return !round.oracleCalled && block.timestamp > (round.closeTimestamp + bufferSeconds) && betInfo.amount != 0 && !betInfo.claimed;
+        return !round.oracleCalled && block.timestamp > (timestamps[epoch].closeTimestamp + intervalSeconds) && betInfo.amount != 0 && !betInfo.claimed;
     }
 
     function oracleInfo() external view returns (address) {
@@ -455,27 +442,27 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
      */
     function _safeStartRound(uint256 epoch) internal {
         require(genesisStartOnce, "req gnsstart");
-        require(rounds[epoch - 2].closeTimestamp != 0);
-        require(block.timestamp >= rounds[epoch - 2].closeTimestamp);
+        require(timestamps[epoch - 2].closeTimestamp != 0);
+        require(block.timestamp >= timestamps[epoch - 2].closeTimestamp);
         _startRound(epoch);
     }
 
     function _startRound(uint256 epoch) internal {
-        Round storage round = rounds[epoch];
-        round.startTimestamp = uint32(block.timestamp);
-        round.lockTimestamp = uint32(block.timestamp) + intervalSeconds;
-        round.closeTimestamp = uint32(block.timestamp) + (intervalSeconds * 2);
+        Timestamps storage ts = timestamps[epoch];
+        ts.startTimestamp = uint32(block.timestamp);
+        ts.lockTimestamp = uint32(block.timestamp) + intervalSeconds;
+        ts.closeTimestamp = uint32(block.timestamp) + (intervalSeconds * 2);
 
         emit PredictionsStartRound(epoch, block.timestamp);
     }
 
     /**
-     * @dev Lock round
+     * @dev Lock round, intervalSeconds is used as the buffer period
      */
     function _safeLockRound(uint256 epoch, int256 price) internal {
-        require(rounds[epoch].startTimestamp != 0);
-        require(block.timestamp >= rounds[epoch].lockTimestamp);
-        require(block.timestamp <= rounds[epoch].lockTimestamp + bufferSeconds, ">buffer");
+        require(timestamps[epoch].startTimestamp != 0);
+        require(block.timestamp >= timestamps[epoch].lockTimestamp);
+        require(block.timestamp <= timestamps[epoch].lockTimestamp + intervalSeconds, ">buffer");
         _lockRound(epoch, price);
     }
 
@@ -487,12 +474,12 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
     }
 
     /**
-     * @dev End round
+     * @dev End round, intervalSeconds is used as the buffer period
      */
     function _safeEndRound(uint256 epoch, int256 price) internal {
-        require(rounds[epoch].lockTimestamp != 0);
-        require(block.timestamp >= rounds[epoch].closeTimestamp);
-        require(block.timestamp <= rounds[epoch].closeTimestamp + bufferSeconds, ">buffer");
+        require(timestamps[epoch].lockTimestamp != 0);
+        require(block.timestamp >= timestamps[epoch].closeTimestamp);
+        require(block.timestamp <= timestamps[epoch].closeTimestamp + intervalSeconds, ">buffer");
         _endRound(epoch, price);
     }
 
@@ -513,7 +500,7 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
         uint256 rewardBaseCalAmount;
         uint256 rewardAmount;
         uint256 treasuryAmt;
-        int8 position = -1;
+        uint8 position = uint8(Position.Undefined);
         // Bull wins
         if (round.closePrice > round.lockPrice) {
             rewardBaseCalAmount = round.bullAmount;
@@ -521,7 +508,7 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
             rewardAmount = round.bearAmount + round.bullAmount - round.treasuryAmount;
             //bonus amount from the fees of the winning side is deducted from the total treasury amount
             treasuryAmt = round.treasuryAmount - round.bullBonusAmount;
-            position = 0;
+            position = uint8(Position.Bull);
         }
         // Bear wins
         else if (round.closePrice < round.lockPrice) {
@@ -530,7 +517,7 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
             rewardAmount = round.bearAmount + round.bullAmount - round.treasuryAmount;
             //bonus amount from the fees of the winning side is deducted from the total treasury amount
             treasuryAmt = round.treasuryAmount - round.bearBonusAmount;
-            position = 1;
+            position = uint8(Position.Bear);
         }
         // House wins
         else {
@@ -550,32 +537,26 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
 
     /**
      * @dev Get latest recorded price from oracle
-     * If it falls below allowed buffer or has not updated, it would be invalid
+     * If it has not updated, it would be invalid
      */
     function _getPriceFromOracle() internal returns (int256) {
-        uint256 leastAllowedTimestamp = block.timestamp + oracleUpdateAllowance;
-        (uint80 roundId, int256 price, , uint256 timestamp, ) = oracle.latestRoundData();
-        require(timestamp <= leastAllowedTimestamp);
+        (uint80 roundId, int256 price, , , ) = oracle.latestRoundData();
         require(roundId > oracleLatestRoundId, "same oracle rnd");
         oracleLatestRoundId = uint256(roundId);
         return price;
     }
 
-    function _safeTransferbetToken(address to, uint256 value) internal {
-        betToken.transfer(to, value);
-    }
-
     /**
      * @dev Determine if a round is valid for receiving bets
      * Round must have started and locked
-     * Current block must be within startTimestamp and closeTimestamp
+     * Current block must be within startTimestamp and lockTimestamp
      */
     function _bettable(uint256 epoch) internal view returns (bool) {
         return
-            rounds[epoch].startTimestamp != 0 &&
-            rounds[epoch].lockTimestamp != 0 &&
-            block.timestamp > rounds[epoch].startTimestamp &&
-            block.timestamp < rounds[epoch].lockTimestamp;
+            timestamps[epoch].startTimestamp != 0 &&
+            timestamps[epoch].lockTimestamp != 0 &&
+            block.timestamp > timestamps[epoch].startTimestamp &&
+            block.timestamp < timestamps[epoch].lockTimestamp;
     }
 
     /**
@@ -585,7 +566,7 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
      * @dev Callable by owner
      */
     function recoverToken(address _token, uint256 _amount, address receiver) external nonReentrant onlyOwner {
-        IERC20(_token).transfer(receiver, _amount);
+        IERC20(_token).safeTransfer(receiver, _amount);
     }
 
     function setReferralRates(uint256 _referrerRate, uint256 _refereeRate) external onlyOwner {
@@ -605,12 +586,11 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
     }
 
     function setStakingLevelBonuses(uint256[] calldata _bonuses) external onlyOwner {
+        require(_bonuses.length > 0 && _bonuses[0] == 0, "l0is0");
         require(_bonuses[_bonuses.length - 1] + refereeRate + referrerRate <= 100, "<100");
-        require(_bonuses[0] == 0, "l0is0");
         for (uint256 i = 0; i < _bonuses.length - 1; i++) {
             require(_bonuses[i] <= _bonuses[i+1],"reqhigher");
         }
-        delete stakingBonuses;
         stakingBonuses = _bonuses;
         emit PredictionsSetStakingLevelBonuses(currentEpoch, _bonuses);
     }
@@ -624,9 +604,8 @@ interface IStaker {
 }
 
 contract PredictionStaker is IStaker, Ownable, ReentrancyGuard {
-
+    using SafeERC20 for IERC20;
     IERC20 public stakingToken;
-    uint256 public totalStaked;
 
     struct stakingInfo {
         uint amount;
@@ -650,12 +629,14 @@ contract PredictionStaker is IStaker, Ownable, ReentrancyGuard {
     event PredictionsStakingWithdraw(address indexed user, uint256 amount, uint256 stakingLevel);
 
     function setStakingToken(address _tokenAddress) external onlyOwner {
+        require(_tokenAddress != address(0));
         stakingToken = IERC20(_tokenAddress);
         emit PredictionsStakingSetToken(_tokenAddress);
     }
 
     function setStakingLevel(uint _levelNo, uint _duration, uint _requiredAmount) external onlyOwner {
         require(_levelNo > 0, "level 0 should be empty");
+
         stakingLevels[_levelNo].duration = _duration;
         stakingLevels[_levelNo].requiredAmount = _requiredAmount;
         if(_levelNo>maxStakingLevel)
@@ -673,23 +654,20 @@ contract PredictionStaker is IStaker, Ownable, ReentrancyGuard {
 
     function deposit(uint _amount, uint _stakingLevel) override external returns (bool){
         require(_stakingLevel > 0, "level 0 is not available");
+        require(_amount > 0, "amount is 0");
         require(maxStakingLevel >= _stakingLevel, "Given staking level does not exist.");
         require(userStakeInfo[msg.sender].stakingLevel < _stakingLevel, "User already has a higher or same stake");
         require(userStakeInfo[msg.sender].amount + _amount == stakingLevels[_stakingLevel].requiredAmount, "You need to stake required amount.");
-        require(stakingToken.transferFrom(msg.sender, address(this), _amount));
-
-        if (userStakeInfo[msg.sender].amount == 0){
-            userStakeInfo[msg.sender].amount = _amount;
-        }else{
-            userStakeInfo[msg.sender].amount = userStakeInfo[msg.sender].amount + _amount;
-        }
-        totalStaked = totalStaked + _amount;
+        
+        userStakeInfo[msg.sender].amount = userStakeInfo[msg.sender].amount + _amount;
 
         userStakeInfo[msg.sender].stakingLevel = _stakingLevel;
         userStakeInfo[msg.sender].requiredAmount = stakingLevels[_stakingLevel].requiredAmount;
         userStakeInfo[msg.sender].releaseDate = block.timestamp + stakingLevels[_stakingLevel].duration;
 
         emit PredictionsStakingDeposit(msg.sender, _amount, _stakingLevel, userStakeInfo[msg.sender].releaseDate);
+
+        stakingToken.safeTransferFrom(msg.sender, address(this), _amount);
 
         return true;
     }
@@ -704,7 +682,7 @@ contract PredictionStaker is IStaker, Ownable, ReentrancyGuard {
         {
             userStakeInfo[msg.sender].stakingLevel = 0;
         }
-        stakingToken.transfer(msg.sender, _amount);
+        stakingToken.safeTransfer(msg.sender, _amount);
 
         emit PredictionsStakingWithdraw(msg.sender, _amount, userStakeInfo[msg.sender].stakingLevel);
 
@@ -745,6 +723,7 @@ contract PredictionReferral is IReferral, Ownable {
 
     //set factory address that will send lock command
     function setFactory(address _factoryAddress) external onlyOwner {
+        require(_factoryAddress != address(0));
         factoryAddress = _factoryAddress;
     }
 
@@ -797,6 +776,8 @@ contract PredictionReferral is IReferral, Ownable {
 }
 
 contract PredictionFactory is Ownable {
+    using SafeERC20 for IERC20;
+    
     uint256 public predictionCount;
     address public adminAddress;
     address public operatorAddress;
@@ -822,21 +803,21 @@ contract PredictionFactory is Ownable {
     function createPrediction(
         AggregatorV3Interface _oracle,
         uint32 _intervalSeconds,
-        uint32 _bufferSeconds,
         uint256 _minBetAmount,
-        uint256 _oracleUpdateAllowance,
         IERC20 _betToken,
         uint256 _treasuryRate,
         uint256 _referrerRate,
         uint256 _refereeRate
     ) external onlyAdmin {
         Prediction pred = new Prediction();
+
+        betTokens[predictionCount] = _betToken;
+        predictions[predictionCount++] = pred;
+
         pred.initialize(
             _oracle,
             _intervalSeconds,
-            _bufferSeconds,
             _minBetAmount,
-            _oracleUpdateAllowance,
             _betToken,
             _treasuryRate, 
             _referrerRate,    
@@ -844,9 +825,6 @@ contract PredictionFactory is Ownable {
             address(referralSystem),
             address(staker)
         );
-
-        betTokens[predictionCount] = _betToken;
-        predictions[predictionCount++] = pred;
     }
 
     function _isContract(address addr) internal view returns (bool) {
@@ -905,27 +883,11 @@ contract PredictionFactory is Ownable {
     }
 
     /**
-     * @dev set buffer Seconds
-     * callable by admin
-     */
-    function setBufferSeconds(uint256 _index, uint32 _bufferSeconds) external onlyAdmin {
-        predictions[_index].setBufferSeconds(_bufferSeconds);
-    }
-
-    /**
      * @dev set Oracle address
      * callable by admin
      */
     function setOracle(uint256 _index, address _oracle) external onlyAdmin {
         predictions[_index].setOracle(_oracle);
-    }
-
-    /**
-     * @dev set oracle update allowance
-     * callable by admin
-     */
-    function setOracleUpdateAllowance(uint256 _index, uint256 _oracleUpdateAllowance) external onlyAdmin {
-        predictions[_index].setOracleUpdateAllowance(_oracleUpdateAllowance);
     }
 
     /**
@@ -958,7 +920,7 @@ contract PredictionFactory is Ownable {
     /**
      * @dev Start the next round n, lock price for round n-1, end round n-2
      */
-    function executeRound(uint256 _index) external onlyOperator {
+    function executeRound(uint256 _index) external {
         predictions[_index].executeRound();
     }
 
@@ -967,8 +929,7 @@ contract PredictionFactory is Ownable {
      */
     function betBear(uint256 _index, uint256 epoch, uint256 amount) external notContract {
         Prediction pred = predictions[_index];
-        IERC20 betToken = betTokens[_index];
-        betToken.transferFrom(msg.sender, address(pred), amount);
+        betTokens[_index].safeTransferFrom(msg.sender, address(pred), amount);
         pred.betBear(epoch, msg.sender, amount);
         if(!referralSystem.isLocked(msg.sender))
         {
@@ -981,8 +942,7 @@ contract PredictionFactory is Ownable {
      */
     function betBull(uint256 _index, uint256 epoch, uint256 amount) external notContract {
         Prediction pred = predictions[_index];
-        IERC20 betToken = betTokens[_index];
-        betToken.transferFrom(msg.sender, address(pred), amount);
+        betTokens[_index].safeTransferFrom(msg.sender, address(pred), amount);
         pred.betBull(epoch, msg.sender, amount);
         if(!referralSystem.isLocked(msg.sender))
         {
@@ -991,6 +951,7 @@ contract PredictionFactory is Ownable {
     }
 
     function claimAllPredictions(uint256[] calldata indeces, uint256[][] calldata epochs) external notContract {
+        require(indeces.length == epochs.length);
         for (uint256 i = 0; i < indeces.length; i++) {
             predictions[indeces[i]].claim(msg.sender, epochs[i]);
         }
@@ -1065,22 +1026,18 @@ contract PredictionFactory is Ownable {
 
     //STAKING AND REFERENCE SYSTEM FUNCTIONS
 
-    function setStaker(address _stakerAddress) external onlyAdmin {
+    function setStaker(uint256 _index, address _stakerAddress) external onlyAdmin {
         staker = IStaker(_stakerAddress);
-        for (uint256 i = 0; i < predictionCount; i++) {
-            predictions[i].setStaker(_stakerAddress);
-        }
+        predictions[_index].setStaker(_stakerAddress);
     }
 
     function setStakingLevelBonuses(uint256 _index, uint256[] calldata _bonuses) external onlyAdmin {
         predictions[_index].setStakingLevelBonuses(_bonuses);
     }
 
-    function setReferralSystem(address _referralSystemAddress) external onlyAdmin {
+    function setReferralSystem(uint256 _index, address _referralSystemAddress) external onlyAdmin {
         referralSystem = IReferral(_referralSystemAddress);
-        for (uint256 i = 0; i < predictionCount; i++) {
-            predictions[i].setReferralSystem(_referralSystemAddress);
-        }
+        predictions[_index].setReferralSystem(_referralSystemAddress);
     }
 
     function setReferralRates(uint256 _index, uint256 _referrerRate, uint256 _refereeRate) external onlyAdmin {
