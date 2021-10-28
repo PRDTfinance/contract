@@ -115,6 +115,7 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
         require(!initialized);
         require(_treasuryRate <= 10, "<10");
         require(_referrerRate + _refereeRate <= 100, "<100");
+        require(_minBetAmount > 100000, ">100000");
 
         initialized = true;
 
@@ -170,6 +171,7 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
      * callable by owner
      */
     function setMinBetAmount(uint256 _minBetAmount) external onlyOwner {
+        require(_minBetAmount > 100000, ">100000");
         minBetAmount = _minBetAmount;
     }
 
@@ -299,7 +301,10 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
 
         //check and set staking bonuses
         uint stakingLvl = staker.getUserStakingLevel(user);
-        if(stakingLvl > 0 && stakingBonuses.length > stakingLvl)
+        if(stakingLvl >= stakingBonuses.length)
+            stakingLvl = stakingBonuses.length - 1;
+
+        if(stakingLvl > 0)
         {
             stakingAmt = treasuryAmt * stakingBonuses[stakingLvl] / 100;
             round.bullBonusAmount = round.bullBonusAmount + stakingAmt;
@@ -675,7 +680,7 @@ contract PredictionStaker is IStaker, Ownable, ReentrancyGuard {
     function withdraw(uint256 _amount) override external nonReentrant returns (bool) {
         require(userStakeInfo[msg.sender].amount >= _amount, "You do not have the entered amount.");
         require(userStakeInfo[msg.sender].releaseDate <= block.timestamp ||
-                userStakeInfo[msg.sender].amount - _amount >= userStakeInfo[msg.sender].requiredAmount, 
+                userStakeInfo[msg.sender].amount - _amount >= stakingLevels[userStakeInfo[msg.sender].stakingLevel].requiredAmount, 
                 "You can't withdraw until your staking period is complete.");
         userStakeInfo[msg.sender].amount = userStakeInfo[msg.sender].amount - _amount;
         if(userStakeInfo[msg.sender].amount < stakingLevels[userStakeInfo[msg.sender].stakingLevel].requiredAmount)
